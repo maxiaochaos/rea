@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import { access, lstat, realpath } from "node:fs/promises";
+import { resolve } from "node:path";
 import { setImmediate } from "node:timers/promises";
 
 import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
@@ -324,10 +325,15 @@ const OPERATION = "analyze_javascript_application";
 /**
  * Resolve the caller-selected input. A missing or unreadable selection is a
  * caller or host-permission failure, not a damaged artifact.
+ *
+ * The input path is normalized with `path.resolve()` before calling `realpath()`
+ * to ensure consistent behavior across platforms, particularly on Windows where
+ * paths with forward slashes may not be handled correctly by `realpath()` alone.
  */
 const resolveSelectedInput = async (inputPath: string): Promise<string> => {
+  const normalizedInput = resolve(inputPath);
   try {
-    const path = await realpath(inputPath);
+    const path = await realpath(normalizedInput);
     await access(path, constants.R_OK);
     return path;
   } catch (cause: unknown) {
