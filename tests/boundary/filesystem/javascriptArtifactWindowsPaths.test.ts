@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolve, win32, posix } from "node:path";
+import { join } from "node:path";
 
 import { reconstructJavaScriptArtifact } from "../../support/javascriptApplicationScope.js";
 import { writeJavaScriptArtifactFixture } from "../../fixtures/javascriptArtifactApplication.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-describe("Windows path semantics for JavaScript artifact reconstruction", () => {
-  it("normalizes relative paths before resolution", async () => {
+describe("JavaScript artifact input path resolution diagnostics", () => {
+  it("succeeds for an existing directory", async () => {
     const root = await fixtureDirectory();
     const result = await reconstructJavaScriptArtifact({
       input_path: root,
@@ -15,7 +15,7 @@ describe("Windows path semantics for JavaScript artifact reconstruction", () => 
     expect(result.format).toBe("directory");
   });
 
-  it("reports the original caller-provided path in validation errors", async () => {
+  it("reports the caller-provided path in ENOENT errors", async () => {
     const nonexistentPath = "/nonexistent/path/to/artifact";
     await expect(
       reconstructJavaScriptArtifact({ input_path: nonexistentPath }),
@@ -25,55 +25,98 @@ describe("Windows path semantics for JavaScript artifact reconstruction", () => 
         {
           path: ["input_path"],
           reason: "invalid_value",
-          message: expect.stringContaining(nonexistentPath),
+          message: expect.stringContaining(
+            "caller path: /nonexistent/path/to/artifact",
+          ),
         },
       ],
     });
   });
 
-  it("verifies path.resolve() normalizes Windows-style paths with forward slashes", () => {
-    const windowsPath = "C:/work/tiny.asar";
-    const resolved = win32.resolve(windowsPath);
-    expect(win32.isAbsolute(resolved)).toBe(true);
-    expect(resolved).toBe("C:\\work\\tiny.asar");
+  it("includes the error code in ENOENT diagnostics", async () => {
+    const nonexistentPath = "/nonexistent/path/to/artifact.asar";
+    await expect(
+      reconstructJavaScriptArtifact({ input_path: nonexistentPath }),
+    ).rejects.toMatchObject({
+      _tag: "AnalysisInputError",
+      issues: [
+        {
+          path: ["input_path"],
+          reason: "invalid_value",
+          message: expect.stringMatching(/\(ENOENT\)/),
+        },
+      ],
+    });
   });
 
-  it("verifies path.resolve() normalizes Windows-style paths with backslashes", () => {
-    const windowsPath = "C:\\work\\tiny.asar";
-    const resolved = win32.resolve(windowsPath);
-    expect(win32.isAbsolute(resolved)).toBe(true);
-    expect(resolved).toBe("C:\\work\\tiny.asar");
+  it("includes syscall information when available in ENOENT diagnostics", async () => {
+    const nonexistentPath = "/nonexistent/path/to/artifact";
+    await expect(
+      reconstructJavaScriptArtifact({ input_path: nonexistentPath }),
+    ).rejects.toMatchObject({
+      _tag: "AnalysisInputError",
+      issues: [
+        {
+          path: ["input_path"],
+          reason: "invalid_value",
+          message: expect.stringMatching(/syscall:/),
+        },
+      ],
+    });
   });
 
-  it("verifies path.resolve() normalizes Windows UNC paths", () => {
-    const uncPath = "\\\\server\\share\\tiny.asar";
-    const resolved = win32.resolve(uncPath);
-    expect(win32.isAbsolute(resolved)).toBe(true);
-    expect(resolved.startsWith("\\\\")).toBe(true);
+  it("reports ENOTDIR for a non-directory parent", async () => {
+    const root = await fixtureDirectory();
+    const packageJsonPath = join(root, "package.json");
+    const invalidPath = join(packageJsonPath, "nested", "file");
+    await expect(
+      reconstructJavaScriptArtifact({ input_path: invalidPath }),
+    ).rejects.toMatchObject({
+      _tag: "AnalysisInputError",
+      issues: [
+        {
+          path: ["input_path"],
+          reason: "invalid_value",
+          message: expect.stringMatching(/\(ENOTDIR\)/),
+        },
+      ],
+    });
   });
 
-  it("verifies Windows path detection for both ASAR and directory paths", () => {
-    const asarPath = "C:/work/tiny.asar";
-    const dirPath = "C:/work/tiny-app";
-
-    expect(win32.isAbsolute(asarPath)).toBe(true);
-    expect(win32.isAbsolute(dirPath)).toBe(true);
-    expect(posix.isAbsolute(asarPath)).toBe(false);
-    expect(posix.isAbsolute(dirPath)).toBe(false);
+  it("preserves the original Error as cause for diagnosis", async () => {
+    const nonexistentPath = "/nonexistent/path/to/artifact";
+    let caughtError: Error | undefined;
+    try {
+      await reconstructJavaScriptArtifact({ input_path: nonexistentPath });
+    } catch (error) {
+      caughtError = error as Error;
+    }
+    expect(caughtError).toBeDefined();
+    expect(caughtError).toHaveProperty("cause");
+    const cause = (caughtError as { cause?: unknown }).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect(cause).toHaveProperty("code", "ENOENT");
   });
 
-  it("handles the path normalization that resolve() applies", () => {
-    const originalPath = "relative/../normalized/file.asar";
-    const normalizedPosix = posix.resolve("/cwd", originalPath);
-    const normalizedWin = win32.resolve("C:\\cwd", originalPath);
-
-    expect(normalizedPosix).toBe("/cwd/normalized/file.asar");
-    expect(normalizedWin).toBe("C:\\cwd\\normalized\\file.asar");
+  it("includes resolved path when different from caller path", async () => {
+    const relativePath = "nonexistent-relative-path";
+    await expect(
+      reconstructJavaScriptArtifact({ input_path: relativePath }),
+    ).rejects.toMatchObject({
+      _tag: "AnalysisInputError",
+      issues: [
+        {
+          path: ["input_path"],
+          reason: "invalid_value",
+          message: expect.stringMatching(/resolved path:/),
+        },
+      ],
+    });
   });
 });
 
 const fixtureDirectory = async (): Promise<string> => {
-  const root = await createTestTempDirectory("rea-windows-path-");
+  const root = await createTestTempDirectory("rea-input-path-diag-");
   await writeJavaScriptArtifactFixture(root);
   return root;
 };

@@ -326,14 +326,16 @@ const OPERATION = "analyze_javascript_application";
  * Resolve the caller-selected input. A missing or unreadable selection is a
  * caller or host-permission failure, not a damaged artifact.
  *
- * The input path is normalized with `path.resolve()` before calling `realpath()`
- * to ensure consistent behavior across platforms, particularly on Windows where
- * paths with forward slashes may not be handled correctly by `realpath()` alone.
+ * The input path is resolved to an absolute path before filesystem operations.
+ * When a filesystem error occurs, the diagnostic message preserves the original
+ * caller-provided path, the resolved path actually used in the syscall, and
+ * any syscall or path information from the underlying error, so that unexpected
+ * failures (e.g., an ENOENT for a file that visibly exists) can be diagnosed.
  */
 const resolveSelectedInput = async (inputPath: string): Promise<string> => {
-  const normalizedInput = resolve(inputPath);
+  const resolvedInput = resolve(inputPath);
   try {
-    const path = await realpath(normalizedInput);
+    const path = await realpath(resolvedInput);
     await access(path, constants.R_OK);
     return path;
   } catch (cause: unknown) {
@@ -343,16 +345,55 @@ const resolveSelectedInput = async (inputPath: string): Promise<string> => {
       throw new AnalysisAccessDeniedError(OPERATION, inputPath, code, {
         cause,
       });
-    if (code === "ENOENT" || code === "ENOTDIR")
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      const syscall =
+        cause instanceof Error && "syscall" in cause
+          ? String(cause.syscall)
+          : undefined;
+      const errorPath =
+        cause instanceof Error &&
+        "path" in cause &&
+        cause.path !== resolvedInput
+          ? String(cause.path)
+          : undefined;
+      const diagnostic = buildInputResolutionDiagnostic(
+        code,
+        inputPath,
+        resolvedInput,
+        syscall,
+        errorPath,
+      );
       throw new AnalysisInputError(OPERATION, { cause }, [
         {
           path: ["input_path"],
           reason: "invalid_value",
-          message: `No file or directory exists at the selected input path (${code}): ${inputPath}`,
+          message: diagnostic,
         },
       ]);
+    }
     throw cause;
   }
+};
+
+/**
+ * Build a diagnostic message for input path resolution failures. Preserves the
+ * caller-provided path, the resolved path used in the syscall, and any syscall
+ * or path information from the underlying error to aid debugging of unexpected
+ * failures where the target visibly exists but the filesystem operation fails.
+ */
+const buildInputResolutionDiagnostic = (
+  code: string,
+  callerPath: string,
+  resolvedPath: string,
+  syscall?: string,
+  errorPath?: string,
+): string => {
+  const parts = [`Selected input path could not be resolved (${code})`];
+  if (syscall !== undefined) parts.push(`syscall: ${syscall}`);
+  parts.push(`caller path: ${callerPath}`);
+  if (resolvedPath !== callerPath) parts.push(`resolved path: ${resolvedPath}`);
+  if (errorPath !== undefined) parts.push(`error path: ${errorPath}`);
+  return parts.join("; ");
 };
 
 /** The selected input's kind, checked against the caller's requested format. */
