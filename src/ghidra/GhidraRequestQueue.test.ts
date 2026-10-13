@@ -41,6 +41,67 @@ describe("Ghidra request queue failure settlement", () => {
     },
   );
 
+  it("drops a queued ready call and detaches an active caller without closing the session", async () => {
+    let releaseActive: () => void = () => undefined;
+    const activeGate = new Promise<void>((resolve) => {
+      releaseActive = resolve;
+    });
+    const started: string[] = [];
+    let stopped = 0;
+    const queue = new GhidraRequestQueue(
+      async (method) => {
+        started.push(method);
+        if (method === "active") await activeGate;
+        return ok({ method });
+      },
+      failure,
+      async () => {
+        stopped += 1;
+      },
+    );
+    const activeController = new AbortController();
+    const active = queue.run(
+      "active",
+      {},
+      {
+        signal: activeController.signal,
+        detachCallerOnActiveAbort: true,
+      },
+    );
+    expect(started).toEqual(["active"]);
+
+    const queuedController = new AbortController();
+    const queued = queue.run(
+      "queued",
+      {},
+      {
+        signal: queuedController.signal,
+        detachCallerOnActiveAbort: true,
+      },
+    );
+    queuedController.abort();
+    await expect(queued).resolves.toMatchObject({
+      ok: false,
+      error: { kind: "cancelled" },
+    });
+    expect(started).toEqual(["active"]);
+
+    activeController.abort();
+    await expect(active).resolves.toMatchObject({
+      ok: false,
+      error: { kind: "cancelled" },
+    });
+    expect(stopped).toBe(0);
+    expect(started).toEqual(["active"]);
+
+    const second = queue.run("second", {}, {});
+    await Promise.resolve();
+    expect(started).toEqual(["active"]);
+    releaseActive();
+    await expect(second).resolves.toEqual(ok({ method: "second" }));
+    expect(started).toEqual(["active", "second"]);
+  });
+
   it("does not replace an executor's typed failure", async () => {
     const original = failure("timeout", "Request deadline elapsed");
     const queue = new GhidraRequestQueue(

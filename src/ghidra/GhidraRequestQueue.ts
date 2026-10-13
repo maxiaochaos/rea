@@ -24,12 +24,23 @@ export type GhidraQueueFailureFactory = (
 /** Stop the provider session when an admitted operation is cancelled. */
 export type GhidraActiveCancellationHandler = () => Promise<void>;
 
+interface GhidraQueueRunOptions extends GhidraRequestOptions {
+  /**
+   * Settle the caller when a request that already reached the bridge is
+   * aborted. The Program operation keeps the queue slot until the bridge
+   * replies, and the live session stays open.
+   */
+  readonly detachCallerOnActiveAbort?: boolean;
+}
+
 interface QueuedRequest {
   readonly method: string;
   readonly parameters: JsonValue;
   readonly signal: AbortSignal | undefined;
+  readonly detachCallerOnActiveAbort: boolean;
   readonly resolve: (result: GhidraQueuedRequestResult) => void;
   readonly onAbort: (() => void) | undefined;
+  callerSettled: boolean;
 }
 
 /** FIFO that admits one Ghidra Program request at a time. */
@@ -48,7 +59,7 @@ export class GhidraRequestQueue {
   run(
     method: string,
     parameters: JsonValue,
-    options: GhidraRequestOptions,
+    options: GhidraQueueRunOptions,
   ): Promise<GhidraQueuedRequestResult> {
     if (this.#closedFailure !== undefined)
       return Promise.resolve(err(this.#closedFailure));
@@ -70,8 +81,10 @@ export class GhidraRequestQueue {
         method,
         parameters,
         signal: options.signal,
+        detachCallerOnActiveAbort: options.detachCallerOnActiveAbort === true,
         resolve,
         onAbort,
+        callerSettled: false,
       };
       this.#queue.push(entry);
       if (onAbort !== undefined)
@@ -99,7 +112,9 @@ export class GhidraRequestQueue {
     const entry = this.#queue.shift();
     if (entry === undefined) return;
     this.#release(entry);
-    if (entry.signal?.aborted === true) {
+    // The caller can abort after this request leaves the queue.
+    const signalAborted = (): boolean => entry.signal?.aborted === true;
+    if (signalAborted()) {
       entry.resolve(
         err(this.failure("cancelled", "Ghidra request was cancelled")),
       );
@@ -109,11 +124,24 @@ export class GhidraRequestQueue {
     this.#active = true;
     let executionSettled = false;
     let activeCancellation: Promise<void> | undefined;
+    const detach = entry.detachCallerOnActiveAbort;
+    const cancelled = err(
+      this.failure("cancelled", "Ghidra request was cancelled"),
+    );
+    const settleCaller = (result: GhidraQueuedRequestResult): void => {
+      if (entry.callerSettled) return;
+      entry.callerSettled = true;
+      entry.resolve(result);
+    };
     const onAbort =
       entry.signal === undefined
         ? undefined
         : () => {
             if (executionSettled) return;
+            if (detach) {
+              settleCaller(cancelled);
+              return;
+            }
             this.failQueued(
               this.failure(
                 "process",
@@ -124,10 +152,20 @@ export class GhidraRequestQueue {
           };
     if (onAbort !== undefined)
       entry.signal?.addEventListener("abort", onAbort, { once: true });
+    // Abort between dequeue and listener installation must not send a
+    // completion request that the caller has already given up.
+    if (detach && signalAborted()) settleCaller(cancelled);
+    if (detach && entry.callerSettled) {
+      if (entry.signal !== undefined && onAbort !== undefined)
+        entry.signal.removeEventListener("abort", onAbort);
+      this.#active = false;
+      if (this.#closedFailure === undefined) this.#drain();
+      return;
+    }
     void this.execute(
       entry.method,
       entry.parameters,
-      entry.signal === undefined ? {} : { signal: entry.signal },
+      detach || entry.signal === undefined ? {} : { signal: entry.signal },
     )
       .then(async (result) => {
         if (activeCancellation !== undefined) {
@@ -146,11 +184,11 @@ export class GhidraRequestQueue {
           }
         }
         executionSettled = true;
-        entry.resolve(result);
+        settleCaller(result);
       })
       .catch((cause: unknown) => {
         executionSettled = true;
-        entry.resolve(
+        settleCaller(
           err(
             this.failure(
               "protocol",

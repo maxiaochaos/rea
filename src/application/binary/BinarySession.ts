@@ -45,6 +45,7 @@ import {
 } from "./BinarySessionExecution.js";
 import { closeAnalysisClient } from "./AnalysisClientCleanup.js";
 import { analysisErrorWithCleanupFailure } from "../../domain/analysisErrorCleanup.js";
+import { ABORTED, waitForAbortable } from "./AbortablePromise.js";
 const OFFICIAL_OPERATIONS: ReadonlySet<string> = new Set(
   OFFICIAL_TOOL_CONTRACTS.map(({ name }) => name),
 );
@@ -555,10 +556,18 @@ export class BinarySession
         ? controller.signal
         : AbortSignal.any([controller.signal, options.signal]);
     const generation = this.#transitionGeneration;
-    const call = active.client.executeIfReady(name, arguments_, {
+    const providerCall = active.client.executeIfReady(name, arguments_, {
       ...options,
       signal,
     });
+    // Close aborts this signal before draining. Settle the registered call
+    // even when the provider ignores cancellation, so completion cannot stall
+    // the transition. The provider still receives the signal and drops work
+    // that has not started.
+    void providerCall.catch(() => undefined);
+    const call = waitForAbortable(providerCall, signal).then((result) =>
+      result === ABORTED ? undefined : result,
+    );
     this.#calls.set(call, generation);
     return call.finally(() => {
       this.#calls.delete(call);

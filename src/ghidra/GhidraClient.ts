@@ -295,18 +295,22 @@ export class GhidraClient {
     );
   }
 
-  /** Dispatch against the connected bridge without invoking startup or retry. */
+  /**
+   * Dispatch against the connected bridge without invoking startup or retry.
+   * Aborting this call drops it while it is still queued. Once the bridge has
+   * the request, only the caller is released: stopping the Program operation
+   * would close the live session.
+   */
   callToolIfReady(
     operation: GhidraOperation,
     parameters: Readonly<Record<string, JsonValue>>,
     options: { readonly signal?: AbortSignal } = {},
   ): Promise<Result<JsonValue, GhidraSessionError> | undefined> {
     if (!this.isReady()) return Promise.resolve(undefined);
-    return this.#requestQueue.run(
-      operation,
-      parameters,
-      options.signal === undefined ? {} : { signal: options.signal },
-    );
+    return this.#requestQueue.run(operation, parameters, {
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      detachCallerOnActiveAbort: true,
+    });
   }
 
   /** Read the private immutable source for format parsers that require captured bytes. */

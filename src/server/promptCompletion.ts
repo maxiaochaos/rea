@@ -1,6 +1,10 @@
 import type { EvidenceReader } from "../application/investigation/InvestigationRecordPort.js";
 import { z } from "zod";
 
+import {
+  ABORTED,
+  waitForAbortable,
+} from "../application/binary/AbortablePromise.js";
 import { uniqueSorted } from "../domain/canonicalOrdering.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
@@ -10,6 +14,13 @@ import { currentMcpRequestSignal } from "./EvidenceMcpServer.js";
 import { artifactInventoryResultSchema } from "../domain/artifactGraph.js";
 import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
 import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
+
+/**
+ * Warm document and procedure completion must not occupy the provider queue.
+ * Long enough for a live inventory reply, and short enough that a queued
+ * lookup cannot stall close or the next analysis call.
+ */
+export const PROMPT_COMPLETION_DEADLINE_MS = 3_000;
 
 const documentListSchema = z.array(z.string().min(1));
 const providerStatusSchema = z.object({
@@ -137,13 +148,21 @@ const completionInventoryLookup = async (
   operation: "list_documents" | "list_procedures",
   parameters: Readonly<Record<string, JsonValue>>,
 ) => {
-  const signal = currentMcpRequestSignal();
-  const options = signal === undefined ? {} : { signal };
-  const result =
+  const request = currentMcpRequestSignal();
+  const deadline = AbortSignal.timeout(PROMPT_COMPLETION_DEADLINE_MS);
+  const signal =
+    request === undefined ? deadline : AbortSignal.any([request, deadline]);
+  const options = { signal };
+  const pending =
     session === undefined
-      ? await analysis.execute(operation, parameters, options)
-      : await session.executeIfProviderReady(operation, parameters, options);
-  return signal?.aborted === true ? undefined : result;
+      ? analysis.execute(operation, parameters, options)
+      : session.executeIfProviderReady(operation, parameters, options);
+  // The deadline can win while the provider is still queued. Own that
+  // rejection so a late provider failure is not unhandled.
+  void pending.catch(() => undefined);
+  const result = await waitForAbortable(pending, signal);
+  if (result === ABORTED || signal.aborted) return undefined;
+  return result;
 };
 
 const providerCandidates = (

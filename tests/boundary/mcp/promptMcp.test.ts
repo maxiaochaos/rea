@@ -35,6 +35,7 @@ import type { BinarySession } from "../../../src/application/binary/BinarySessio
 import { PROMPT_CONTRACTS } from "../../../src/contracts/promptContracts.js";
 import { createEvidence } from "../../../src/domain/evidence.js";
 import { createServer } from "../../../src/server/createServer.js";
+import { PROMPT_COMPLETION_DEADLINE_MS } from "../../../src/server/promptCompletion.js";
 import { registerGuidedPrompts } from "../../../src/server/registerPrompts.js";
 import { EvidenceMcpServer } from "../../../src/server/EvidenceMcpServer.js";
 import { ToolResultDelivery } from "../../../src/server/toolResult.js";
@@ -379,6 +380,87 @@ it("guided prompt completion avoids cold startup and cancels warm lookup on clos
   await lifecycle.aborted;
   expect((await pending).completion.values).toEqual([]);
 }, 10_000);
+
+it("returns completion during provider startup without delaying close", async () => {
+  const directory = await createTestTempDirectory("rea-prompt-startup-close-");
+  temporaryDirectories.push(directory);
+  const target = join(directory, "target.hop");
+  await writeFile(target, "fixture target");
+  const fixture = await createWarmCompletionFixture(target);
+  const { client } = fixture;
+
+  const opened = await client.callTool({
+    name: "open_binary",
+    arguments: { path: target },
+  });
+  expect(opened.isError).not.toBe(true);
+  expect(fixture.childrenCreated()).toBe(0);
+
+  const startup = fixture.holdStartup();
+  const warming = client.callTool({ name: "list_documents", arguments: {} });
+  await startup.started;
+  const startedAt = performance.now();
+  expect(await complete(client, "document", "")).toEqual([]);
+  expect(await complete(client, "procedure", "")).toEqual([]);
+  expect(performance.now() - startedAt).toBeLessThan(1_000);
+  expect(fixture.childrenCreated()).toBe(1);
+
+  const closing = client.callTool({ name: "close_binary", arguments: {} });
+  const stillStarting = await Promise.race([
+    closing.then(() => "closed" as const),
+    new Promise<"pending">((resolve) => {
+      setTimeout(() => resolve("pending"), 150);
+    }),
+  ]);
+  expect(stillStarting).toBe("pending");
+  const releasedAt = performance.now();
+  startup.finish();
+  const closed = await closing;
+  expect(performance.now() - releasedAt).toBeLessThan(1_000);
+  expect(closed.isError).not.toBe(true);
+  const warmed = await warming;
+  expect(warmed.isError, JSON.stringify(warmed)).not.toBe(true);
+}, 10_000);
+
+it("bounds a warm completion and then closes without waiting on it", async () => {
+  const directory = await createTestTempDirectory("rea-prompt-deadline-");
+  temporaryDirectories.push(directory);
+  const target = join(directory, "target.hop");
+  await writeFile(target, "fixture target");
+  const fixture = await createWarmCompletionFixture(target);
+  const { client } = fixture;
+
+  const opened = await client.callTool({
+    name: "open_binary",
+    arguments: { path: target },
+  });
+  expect(opened.isError).not.toBe(true);
+  const startup = fixture.holdStartup();
+  const warming = client.callTool({ name: "list_documents", arguments: {} });
+  await startup.started;
+  startup.finish();
+  const warmed = await warming;
+  expect(warmed.isError, JSON.stringify(warmed)).not.toBe(true);
+  expect(await complete(client, "document", "fixture")).toEqual([
+    "fixture-document",
+  ]);
+
+  const blocked = fixture.holdCompletion();
+  const startedAt = performance.now();
+  expect(await complete(client, "document", "")).toEqual([]);
+  const elapsed = performance.now() - startedAt;
+  expect(elapsed).toBeGreaterThan(1_000);
+  expect(elapsed).toBeLessThan(PROMPT_COMPLETION_DEADLINE_MS + 2_000);
+  await blocked.aborted;
+
+  const closeStarted = performance.now();
+  const closed = await client.callTool({
+    name: "close_binary",
+    arguments: {},
+  });
+  expect(performance.now() - closeStarted).toBeLessThan(1_000);
+  expect(closed.isError).not.toBe(true);
+}, 15_000);
 
 describe("guided prompt completion lifecycle", () => {
   it("survives a cancelled completion and ignores its late result", async () => {

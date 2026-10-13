@@ -93,9 +93,11 @@ Completion sources are live projections of the current session:
 
 Document and procedure completion in a binary session reads an already-ready
 provider; it does not start analysis. A cold provider, a target transition, or
-unavailable inventory can return no suggestions. Run an analysis query first
-when you need inventory from a provider that supplies it. An empty completion
-list does not establish that the target has no procedures.
+unavailable inventory can return no suggestions. A ready lookup is abandoned
+after a few seconds so it cannot wait behind the provider queue or delay
+closing the target. Run an analysis query first when you need inventory from a
+provider that supplies it. An empty completion list does not establish that the
+target has no procedures.
 
 | Argument family     | Source and filtering                                                                                                                                 |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |

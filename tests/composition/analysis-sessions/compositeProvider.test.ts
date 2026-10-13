@@ -54,6 +54,46 @@ describe("composite analysis provider", () => {
     });
   });
 
+  it("does not create a child until a real operation, then serves ready lookups", async () => {
+    let created = 0;
+    const identity: ProviderIdentity = {
+      id: "deep",
+      name: "deep",
+      version: "1",
+    };
+    const deep: AnalysisProvider = {
+      identity: () => identity,
+      capabilities: () => [capability(identity, "list_documents")],
+      createClient: () => {
+        created += 1;
+        return {
+          execute: () =>
+            Promise.resolve(ok(createAnalysisExecution(["doc"], identity))),
+          executeIfReady: () =>
+            Promise.resolve(ok(createAnalysisExecution(["doc"], identity))),
+          close: () => Promise.resolve(ok(null)),
+        };
+      },
+    };
+    const client = new CompositeProvider([deep]).createClient(target);
+
+    await expect(client.executeIfReady?.("list_documents", {})).resolves.toBe(
+      undefined,
+    );
+    expect((await client.execute("health", {})).ok).toBe(true);
+    expect(created).toBe(0);
+
+    expect((await client.execute("list_documents", {})).ok).toBe(true);
+    expect(created).toBe(1);
+    await expect(
+      client.executeIfReady?.("list_documents", {}),
+    ).resolves.toMatchObject({
+      ok: true,
+      value: { result: ["doc"] },
+    });
+    expect(created).toBe(1);
+  });
+
   it("rejects ambiguous provider routes", () => {
     const hopper = provider("hopper", "address_name", []);
     expect(
